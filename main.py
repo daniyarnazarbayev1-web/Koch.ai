@@ -1,14 +1,27 @@
 import os
 import json
+import itertools
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from groq import AsyncGroq
 
 app = FastAPI(title="Коч.ai")
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+# 1. Считываем ключи и настраиваем бесконечный ротатор (Round-Robin)
+raw_keys = os.environ.get("GROQ_API_KEY", "")
+API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 
+if not API_KEYS:
+    # Запасной вариант для локального теста, если переменная пустая
+    API_KEYS = ["gsk_dummy_key"]
+
+key_cycle = itertools.cycle(API_KEYS)
+
+def get_groq_client() -> AsyncGroq:
+    """Возвращает экземпляр AsyncGroq с новым ключом из списка для каждого запроса"""
+    return AsyncGroq(api_key=next(key_cycle))
+
+# Модели для цепочки
 MODEL_GEN = "openai/gpt-oss-120b"
 MODEL_CRITIC = "qwen/qwen3.6-27b"
 MODEL_FINAL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -68,7 +81,6 @@ HTML_CONTENT = """
             text-transform: uppercase;
         }
 
-        /* Чат и история */
         .chat-history {
             display: flex;
             flex-direction: column;
@@ -108,7 +120,6 @@ HTML_CONTENT = """
             word-break: break-word;
         }
 
-        /* Сеция агентов */
         .agents-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -145,7 +156,6 @@ HTML_CONTENT = """
             min-height: 40px;
         }
 
-        /* Поле ввода */
         .input-area {
             display: flex;
             gap: 10px;
@@ -210,6 +220,7 @@ HTML_CONTENT = """
     <script>
         let ws;
         let contextHistory = [];
+        let currentTurn = null;
 
         function connectWS() {
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -238,8 +249,6 @@ HTML_CONTENT = """
             if (e.key === 'Enter') sendQuery();
         }
 
-        let currentTurn = null;
-
         function sendQuery() {
             const input = document.getElementById('query-input');
             const btn = document.getElementById('send-btn');
@@ -247,7 +256,6 @@ HTML_CONTENT = """
 
             if (!text || btn.disabled) return;
 
-            // Отображение сообщения пользователя
             const chat = document.getElementById('chat');
             chat.innerHTML += `
                 <div class="message user">
@@ -257,7 +265,6 @@ HTML_CONTENT = """
 
             contextHistory.push({"role": "user", "content": text});
 
-            // Отправка данных на бэкенд
             ws.send(JSON.stringify({
                 query: text,
                 history: contextHistory
@@ -351,9 +358,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
             await websocket.send_json({"type": "agent_start"})
 
-            # --- 1. ШАГ: Генератор (Стриминг) ---
+            # --- 1. ШАГ: Генератор (Стреляет 1-м ключом) ---
+            gen_client = get_groq_client()
             gen_messages = [{"role": "system", "content": "Дай развернутый, глубокий ответ."}] + history
-            gen_stream = await groq_client.chat.completions.create(
+            gen_stream = await gen_client.chat.completions.create(
                 model=MODEL_GEN,
                 messages=gen_messages,
                 stream=True
@@ -365,12 +373,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 draft_text += content
                 await websocket.send_json({"type": "agent_stream", "agent": "generator", "text": content})
 
-            # --- 2. ШАГ: Критик (Стриминг) ---
+            # --- 2. ШАГ: Критик (Стреляет 2-м ключом) ---
+            critic_client = get_groq_client()
             critic_messages = [
                 {"role": "system", "content": "Найди логические ошибки, неточности и слабые места в черновом ответе."},
                 {"role": "user", "content": f"Запрос: {user_query}\nЧерновик: {draft_text}"}
             ]
-            critic_stream = await groq_client.chat.completions.create(
+            critic_stream = await critic_client.chat.completions.create(
                 model=MODEL_CRITIC,
                 messages=critic_messages,
                 stream=True
@@ -382,12 +391,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 critique_text += content
                 await websocket.send_json({"type": "agent_stream", "agent": "critic", "text": content})
 
-            # --- 3. ШАГ: Финализатор (Стриминг) ---
+            # --- 3. ШАГ: Финализатор (Стреляет 3-м ключом) ---
+            final_client = get_groq_client()
             final_messages = history + [
                 {"role": "system", "content": "Напиши идеальный итоговый ответ с учетом критических замечаний. Исключи черновики и воду."},
                 {"role": "user", "content": f"Черновой вариант: {draft_text}\nЗамечания критика: {critique_text}"}
             ]
-            final_stream = await groq_client.chat.completions.create(
+            final_stream = await final_client.chat.completions.create(
                 model=MODEL_FINAL,
                 messages=final_messages,
                 stream=True
@@ -403,3 +413,4 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         pass
+            
